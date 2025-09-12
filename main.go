@@ -1,6 +1,8 @@
 package main
 
 import (
+	"log"
+	"os"
 	"simvizlab-backend/config"
 	"simvizlab-backend/infra/database"
 	"simvizlab-backend/infra/logger"
@@ -8,10 +10,21 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/subosito/gotenv"
 )
 
 func main() {
-	//set timezone
+	//Env setup
+	env := os.Getenv("GO_ENV")
+	if env == "" {
+		env = "dev" // default to dev
+	}
+
+	envFile := ".env." + env
+	if err := gotenv.Load(envFile); err != nil {
+		log.Fatalf("Failed to load %s: %v", envFile, err)
+	}
+
 	viper.SetDefault("SERVER_TIMEZONE", "Asia/Dhaka")
 	loc, _ := time.LoadLocation(viper.GetString("SERVER_TIMEZONE"))
 	time.Local = loc

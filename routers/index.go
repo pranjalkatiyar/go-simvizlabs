@@ -22,5 +22,6 @@ func RegisterRoutes(route *gin.Engine) {
 
 		// Add all other routes within the api group
 		UserRoutes(api.Group("/user"))
+		AppStoreRoutes(api.Group("/appstore"))
 	}
 }

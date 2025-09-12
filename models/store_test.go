@@ -1,4 +1,4 @@
-package service
+package models
 
 import (
 	"context"
@@ -21,7 +21,7 @@ func TestStoreClient_LookupOrderID(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    args
-		wantRsp *orderlookupresponse
+		wantRsp *OrderLookupResponse
 		wantErr bool
 	}{
 		{
