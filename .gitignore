@@ -1,5 +1,5 @@
 # Binaries for programs and plugins
-.env.*
+.env*
 *.exe
 *.exe~
 *.dll

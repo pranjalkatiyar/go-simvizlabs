@@ -13,7 +13,6 @@ func UserRoutes(rg *gin.RouterGroup) {
 	// rg.GET("/:id", user.GetUserByID)
 	rg.POST("/", user.CreateUser)
 	rg.PUT("/:id", user.UpdateUser)
-
-	rg.GET("/transaction",user.GetTransaction)
 	// rg.DELETE("/:id", user.DeleteUser)
+
 }

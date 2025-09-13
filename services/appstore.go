@@ -28,11 +28,7 @@ func FetchTransaction(jwtToken, transactionID string) ([]byte, error) {
 }
 
 func FetchTransactionHistory(jwtToken, transactionID string) ([]byte, error) {
-	env := os.Getenv("APPSTORE_ENV")
-	baseURL := "https://api.storekit.itunes.apple.com"
-	if env == "sandbox" {
-		baseURL = "https://api.storekit-sandbox.itunes.apple.com"
-	}
+	baseURL := os.Getenv("BASE_URL")
 
 	url := fmt.Sprintf("%s/inApps/v2/history/%s", baseURL, transactionID)
 
