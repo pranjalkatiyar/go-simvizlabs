@@ -2,20 +2,21 @@ package user
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"simvizlab-backend/models"
-	"simvizlab-backend/repository/mongo"
+	mongoRepo "simvizlab-backend/repository/mongo"
 	"simvizlab-backend/services"
 	"simvizlab-backend/utils"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 func GetAllUsers(ctx *gin.Context) {
 	var users []*models.User
-	err := mongo.Get("users", &users)
+	err := mongoRepo.Get("users", &users)
 
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -37,7 +38,7 @@ func GetAllUsers(ctx *gin.Context) {
 
 func GetOneUser(ctx *gin.Context) {
 	var user models.User
-	err := mongo.GetOne("users", nil, &user)
+	err := mongoRepo.GetOne("users", nil, &user)
 
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -47,71 +48,110 @@ func GetOneUser(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, user)
 }
 
-func CreateUser(ctx *gin.Context) {
+func respondWithError(ctx *gin.Context, status int, message string, details ...string) {
+	resp := gin.H{"error": message}
+	if len(details) > 0 {
+		resp["details"] = details[0]
+	}
+	ctx.JSON(status, resp)
+}
 
-	// 1. Bind request
+func CreateUser(ctx *gin.Context) {
 	var req models.CreateUserRequest
 	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondWithError(ctx, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
 
 	if req.AppleAppId <= 0 {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "AppleAppId must be a positive integer"})
+		respondWithError(ctx, http.StatusBadRequest, "AppleAppId must be a positive integer")
 		return
 	}
 
-	//check if user already exist or not ?
 	var existingUser models.User
-	err := mongo.GetOne("users", bson.M{"appleAppId": req.AppleAppId}, &existingUser)
+	err := mongoRepo.GetOne("users", bson.M{"appleAppId": req.AppleAppId}, &existingUser)
 
 	if err == nil {
-		ctx.JSON(http.StatusConflict, gin.H{"error": "User with this AppleAppId already exists", "existUser": true})
+		respondWithError(ctx, http.StatusConflict, "User with this AppleAppId already exists")
+		return
+	} else if !errors.Is(err, mongo.ErrNoDocuments) {
+		respondWithError(ctx, http.StatusInternalServerError, "Database error while checking user existence", err.Error())
 		return
 	}
 
 	jwtToken, err := utils.GenerateAppStoreJWT()
-
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate JWT"})
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to generate JWT", err.Error())
 		return
 	}
-	// 2. Call Apple Transaction API
-	data, err := services.FetchTransaction(jwtToken, req.TransactionId)
+
+	data, err := services.FetchTransaction(jwtToken, req.OriginalTransactionId)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch transaction"})
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to fetch transaction", err.Error())
 		return
 	}
 
 	var response models.TransactionInfoResponse
-
 	if err := json.Unmarshal(data, &response); err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse transaction response"})
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to parse transaction response", err.Error())
 		return
 	}
 
 	results, err := utils.DecodeSignedTransactionInfo(string(response.SignedTransactionInfo))
-
-	fmt.Println("results:", results)
-
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode transaction data"})
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to decode transaction data", err.Error())
+		return
+	}
+
+	var decodedInfo models.JWSTransaction
+
+	jsonBytes, err := json.Marshal(results)
+	if err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to re-encode transaction map", err.Error())
+		return
+	}
+
+	if err := json.Unmarshal(jsonBytes, &decodedInfo); err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to parse decoded transaction data", err.Error())
 		return
 	}
 
 	user := models.User{
-		AppleAppId: req.AppleAppId,
-		
+		AppleAppId:            req.AppleAppId,
+		OriginalTransactionId: req.OriginalTransactionId,
 	}
-
-	// err := mongo.Save("users", &user)
-
-	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := mongoRepo.Save("users", &user); err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to save user", err.Error())
 		return
 	}
 
-	ctx.JSON(http.StatusCreated, user)
+	transaction := models.JWSTransaction{
+		AppleAppId:            req.AppleAppId,
+		AppTransactionId:      decodedInfo.AppTransactionId,
+		OriginalTransactionId: req.OriginalTransactionId,
+		WebOrderLineItemId:    decodedInfo.WebOrderLineItemId,
+		BundleID:              decodedInfo.BundleID,
+		ProductID:             decodedInfo.ProductID,
+		PurchaseDate:          decodedInfo.PurchaseDate,
+		ExpiresDate:           decodedInfo.ExpiresDate,
+		Currency:              decodedInfo.Currency,
+		OriginalPurchaseDate:  decodedInfo.OriginalPurchaseDate,
+		Storefront:            decodedInfo.Storefront,
+		Environment:           decodedInfo.Environment,
+		SignedDate:            decodedInfo.SignedDate,
+		Price:                 decodedInfo.Price,
+		// Add more fields from results as needed
+	}
+
+	if err := mongoRepo.Save("transactions", &transaction); err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to save transaction", err.Error())
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, gin.H{
+		"user":        user,
+		"transaction": transaction,
+	})
 }
 
 func UpdateUser(ctx *gin.Context) {
@@ -120,7 +160,7 @@ func UpdateUser(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	err := mongo.Update("users", map[string]interface{}{"_id": user.ID}, &user)
+	err := mongoRepo.Update("users", map[string]interface{}{"_id": user.ID}, &user)
 
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

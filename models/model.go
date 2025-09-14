@@ -174,6 +174,7 @@ const (
 
 // JWSTransaction https://developer.apple.com/documentation/appstoreserverapi/jwstransaction
 type JWSTransaction struct {
+	AppleAppId                  int64             `json:"appleAppIid,omitempty"`
 	AppTransactionId            string            `json:"appTransactionId,omitempty"`
 	TransactionID               string            `json:"transactionId,omitempty"`
 	OriginalTransactionId       string            `json:"originalTransactionId,omitempty"`
@@ -229,6 +230,10 @@ func (J JWSTransaction) GetNotBefore() (*jwt.NumericDate, error) {
 
 func (J JWSTransaction) GetSubject() (string, error) {
 	return "", nil
+}
+
+func (J *JWSTransaction) CollectionName() string {
+	return "transactions"
 }
 
 // https://developer.apple.com/documentation/appstoreserverapi/extendreasoncode
