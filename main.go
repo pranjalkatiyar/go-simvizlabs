@@ -20,9 +20,6 @@ func main() {
 
 	// envFile := ".env." + env
 	gotenv.Load()
-	// if err := gotenv.Load(envFile); err != nil {
-	// 	log.Fatalf("Failed to load %s: %v", envFile, err)
-	// }
 
 	viper.SetDefault("SERVER_TIMEZONE", "Asia/Dhaka")
 	loc, _ := time.LoadLocation(viper.GetString("SERVER_TIMEZONE"))

@@ -8,6 +8,8 @@ import (
 	mongoRepo "simvizlab-backend/repository/mongo"
 	"simvizlab-backend/services"
 	"simvizlab-backend/utils"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
@@ -168,4 +170,219 @@ func UpdateUser(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, user)
+}
+
+func CheckUserSubscriptionStatus(ctx *gin.Context) {
+	appleIDStr := ctx.Query("appleAppId")
+	if appleIDStr == "" {
+		respondWithError(ctx, http.StatusBadRequest, "appleAppId is required")
+		return
+	}
+	appleAppId, err := strconv.ParseInt(appleIDStr, 10, 64)
+	if err != nil || appleAppId <= 0 {
+		respondWithError(ctx, http.StatusBadRequest, "appleAppId must be a positive integer")
+		return
+	}
+
+	var user models.User
+	if err := mongoRepo.GetOne("users", bson.M{"appleAppId": appleAppId}, &user); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			respondWithError(ctx, http.StatusNotFound, "user not found")
+			return
+		}
+		respondWithError(ctx, http.StatusInternalServerError, "database error", err.Error())
+		return
+	}
+
+	// Prefer explicit transactionId; otherwise use originalTransactionId (query or stored)
+	transactionId := ctx.Query("transactionId")
+	originalTransactionId := ctx.Query("originalTransactionId")
+	if originalTransactionId == "" {
+		originalTransactionId = user.OriginalTransactionId
+	}
+
+	jwtToken, err := utils.GenerateAppStoreJWT()
+	if err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "failed to generate JWT", err.Error())
+		return
+	}
+
+	var data []byte
+	if transactionId != "" {
+		data, err = services.FetchTransaction(jwtToken, transactionId)
+	} else {
+		if originalTransactionId == "" {
+			respondWithError(ctx, http.StatusBadRequest, "originalTransactionId is required when transactionId is not provided")
+			return
+		}
+		data, err = services.FetchTransactionHistory(jwtToken, originalTransactionId)
+	}
+	if err != nil {
+		respondWithError(ctx, http.StatusBadRequest, "failed to fetch App Store data", err.Error())
+		return
+	}
+
+	var jws string
+	if transactionId != "" {
+		var tr models.TransactionInfoResponse
+		if err := json.Unmarshal(data, &tr); err != nil {
+			respondWithError(ctx, http.StatusInternalServerError, "failed to parse transaction response", err.Error())
+			return
+		}
+		jws = tr.SignedTransactionInfo
+	} else {
+		var hist models.HistoryResponse
+		if err := json.Unmarshal(data, &hist); err != nil {
+			respondWithError(ctx, http.StatusInternalServerError, "failed to parse history response", err.Error())
+			return
+		}
+		if len(hist.SignedTransactions) == 0 {
+			respondWithError(ctx, http.StatusNotFound, "no transactions found for originalTransactionId")
+			return
+		}
+		jws = hist.SignedTransactions[0]
+	}
+
+	decoded, err := utils.DecodeSignedTransactionInfo(jws)
+	if err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "failed to decode transaction JWS", err.Error())
+		return
+	}
+
+	var tx models.JWSTransaction
+	raw, _ := json.Marshal(decoded)
+	if err := json.Unmarshal(raw, &tx); err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "failed to parse decoded transaction", err.Error())
+		return
+	}
+
+	// Determine active status by expiry (tolerate seconds or milliseconds)
+	expires := tx.ExpiresDate
+	nowMs := time.Now().UnixMilli()
+	if expires > 0 && expires < 1_000_000_000_000 {
+		expires *= 1000
+	}
+	active := expires == 0 || expires > nowMs
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"exists":      true,
+		"active":      active,
+		"expiresAtMs": expires,
+		"nowMs":       nowMs,
+		"user":        user,
+		"transaction": tx,
+	})
+}
+
+func LoginAndCheckStatus(ctx *gin.Context) {
+	type reqBody struct {
+		AppleAppId            int64  `json:"appleAppId" binding:"required"`
+		OriginalTransactionId string `json:"originalTransactionId" binding:"required"`
+	}
+	var req reqBody
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		respondWithError(ctx, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	// Find existing transactionApple record (if any)
+	var existing models.TransactionApple
+	findErr := mongoRepo.GetOne(
+		"transactionApple",
+		bson.M{"appleAppId": req.AppleAppId, "originalTransactionId": req.OriginalTransactionId},
+		&existing,
+	)
+
+	// Generate App Store JWT
+	jwtToken, err := utils.GenerateAppStoreJWT()
+	if err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to generate JWT", err.Error())
+		return
+	}
+
+	// Call Apple get-all-subscription-statuses
+	data, err := services.FetchAllSubscriptionStatuses(jwtToken, req.OriginalTransactionId)
+	if err != nil {
+		respondWithError(ctx, http.StatusBadRequest, "Failed to fetch subscription statuses", err.Error())
+		return
+	}
+
+	var statusResp models.StatusResponse
+	if err := json.Unmarshal(data, &statusResp); err != nil {
+		respondWithError(ctx, http.StatusInternalServerError, "Failed to parse subscription statuses", err.Error())
+		return
+	}
+
+	// Extract a representative status (pick first group -> first lastTransaction)
+	var statusCode int32
+	if len(statusResp.Data) > 0 && len(statusResp.Data[0].LastTransactions) > 0 {
+		statusCode = statusResp.Data[0].LastTransactions[0].Status
+	}
+
+	// Map status to text
+	statusText := mapStatusText(statusCode)
+
+	// Decide active (not expired) – treat Active(1) and Grace Period(4) as active
+	active := statusCode == 1 || statusCode == 4
+
+	now := time.Now()
+
+	// Prepare upsert doc
+	doc := models.TransactionApple{
+		AppleAppId:            req.AppleAppId,
+		OriginalTransactionId: req.OriginalTransactionId,
+		Status:                statusCode,
+		StatusText:            statusText,
+		BundleId:              statusResp.BundleId,
+		Environment:           statusResp.Environment,
+		UpdatedAt:             now,
+	}
+
+	if findErr == nil {
+		// Update existing
+		doc.ID = existing.ID
+		if err := mongoRepo.Update(
+			"transactionApple",
+			bson.M{"_id": existing.ID},
+			&doc,
+		); err != nil {
+			respondWithError(ctx, http.StatusInternalServerError, "Failed to update transactionApple", err.Error())
+			return
+		}
+	} else if !errors.Is(findErr, mongo.ErrNoDocuments) {
+		respondWithError(ctx, http.StatusInternalServerError, "Database error while checking existing record", findErr.Error())
+		return
+	} else {
+		// Create new
+		if err := mongoRepo.Save("transactionApple", &doc); err != nil {
+			respondWithError(ctx, http.StatusInternalServerError, "Failed to save transactionApple", err.Error())
+			return
+		}
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"exists":     findErr == nil,
+		"status":     statusCode,
+		"statusText": statusText,
+		"active":     active,
+		"bundleId":   statusResp.BundleId,
+		"env":        statusResp.Environment,
+	})
+}
+
+func mapStatusText(s int32) string {
+	switch s {
+	case 1:
+		return "Active"
+	case 2:
+		return "Expired"
+	case 3:
+		return "Billing Retry"
+	case 4:
+		return "Billing Grace Period"
+	case 5:
+		return "Revoked"
+	default:
+		return "Unknown"
+	}
 }
