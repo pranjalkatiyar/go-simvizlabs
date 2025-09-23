@@ -14,4 +14,7 @@ func UserRoutes(rg *gin.RouterGroup) {
 	rg.POST("/", user.CreateUser)
 	rg.PUT("/:id", user.UpdateUser)
 	// rg.DELETE("/:id", user.DeleteUser)
+	rg.GET("/status", user.CheckUserSubscriptionStatus)
+	rg.POST("/login-status", user.LoginAndCheckStatus)
+
 }

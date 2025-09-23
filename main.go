@@ -8,10 +8,19 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/subosito/gotenv"
 )
 
 func main() {
-	//set timezone
+	//Env setup
+	// env := os.Getenv("GO_ENV")
+	// if env == "" {
+	// 	env = "dev" // default to dev
+	// }
+
+	// envFile := ".env." + env
+	gotenv.Load()
+
 	viper.SetDefault("SERVER_TIMEZONE", "Asia/Dhaka")
 	loc, _ := time.LoadLocation(viper.GetString("SERVER_TIMEZONE"))
 	time.Local = loc

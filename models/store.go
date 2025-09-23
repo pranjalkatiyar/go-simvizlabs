@@ -1,420 +1,565 @@
 package models
 
 import (
+	"bytes"
+	"context"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// OrderLookupResponse https://developer.apple.com/documentation/appstoreserverapi/orderlookupresponse
-type OrderLookupResponse struct {
-	Status             int      `json:"status"`
-	SignedTransactions []string `json:"signedTransactions"`
-}
-
-type Environment string
-
-// Environment https://developer.apple.com/documentation/appstoreserverapi/environment
 const (
-	Sandbox    Environment = "Sandbox"
-	Production Environment = "Production"
+	HostSandBox    = "https://api.storekit-sandbox.itunes.apple.com"
+	HostProduction = "https://api.storekit.itunes.apple.com"
+
+	PathTransactionInfo                     = "/inApps/v1/transactions/{transactionId}"
+	PathLookUp                              = "/inApps/v1/lookup/{orderId}"
+	PathTransactionHistory                  = "/inApps/v2/history/{originalTransactionId}"
+	PathRefundHistory                       = "/inApps/v2/refund/lookup/{originalTransactionId}"
+	PathGetALLSubscriptionStatus            = "/inApps/v1/subscriptions/{originalTransactionId}"
+	PathConsumptionInfo                     = "/inApps/v1/transactions/consumption/{originalTransactionId}"
+	PathExtendSubscriptionRenewalDate       = "/inApps/v1/subscriptions/extend/{originalTransactionId}"
+	PathExtendSubscriptionRenewalDateForAll = "/inApps/v1/subscriptions/extend/mass/"
+	PathGetStatusOfSubscriptionRenewalDate  = "/inApps/v1/subscriptions/extend/mass/{productId}/{requestIdentifier}"
+	PathGetNotificationHistory              = "/inApps/v1/notifications/history"
+	PathRequestTestNotification             = "/inApps/v1/notifications/test"
+	PathGetTestNotificationStatus           = "/inApps/v1/notifications/test/{testNotificationToken}"
+	PathSetAppAccountToken                  = "/inApps/v1/transactions/{originalTransactionId}/appAccountToken"
 )
 
-// HistoryResponse https://developer.apple.com/documentation/appstoreserverapi/historyresponse
-type HistoryResponse struct {
-	AppAppleId         int64       `json:"appAppleId"`
-	BundleId           string      `json:"bundleId"`
-	Environment        Environment `json:"environment"`
-	HasMore            bool        `json:"hasMore"`
-	Revision           string      `json:"revision"`
-	SignedTransactions []string    `json:"signedTransactions"`
+type StoreConfig struct {
+	KeyContent         []byte         // Loads a .p8 certificate
+	KeyID              string         // Your private key ID from App Store Connect (Ex: 2X9R4HXF34)
+	BundleID           string         // Your app’s bundle ID
+	Issuer             string         // Your issuer ID from the Keys page in App Store Connect (Ex: "57246542-96fe-1a63-e053-0824d011072a")
+	Audience           string         // Your audience (aud) for generating the token (some Apple APIs require a specific aud, such as Sign In with Apple ID).
+	Sandbox            bool           // default is Production
+	TokenIssuedAtFunc  func() int64   // The token’s creation time func. Default is current timestamp.
+	TokenExpiredAtFunc func() int64   // The token’s expiration time func. Default is one hour later.
+	TrustedCertPool    *x509.CertPool // The pool of trusted root certificates. Default is a pool containing only Apple Root CA - G3.
 }
 
-// TransactionInfoResponse https://developer.apple.com/documentation/appstoreserverapi/transactioninforesponse
-type TransactionInfoResponse struct {
-	SignedTransactionInfo string `json:"signedTransactionInfo"`
+type StoreClient struct {
+	Token   *Token
+	httpCli HTTPClient
+	cert    *Cert
+	hostUrl string
 }
 
-// RefundLookupResponse same as the RefundHistoryResponse https://developer.apple.com/documentation/appstoreserverapi/refundhistoryresponse
-type RefundLookupResponse struct {
-	HasMore            bool     `json:"hasMore"`
-	Revision           string   `json:"revision"`
-	SignedTransactions []string `json:"signedTransactions"`
+// NewStoreClient create a appstore server api client
+func NewStoreClient(config *StoreConfig) *StoreClient {
+	token := &Token{}
+	token.WithConfig(config)
+	hostUrl := HostProduction
+	if config.Sandbox {
+		hostUrl = HostSandBox
+	}
+
+	client := &StoreClient{
+		Token: token,
+		cert:  newCert(config.TrustedCertPool),
+		httpCli: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		hostUrl: hostUrl,
+	}
+	return client
 }
 
-// StatusResponse https://developer.apple.com/documentation/appstoreserverapi/get_all_subscription_statuses
-type StatusResponse struct {
-	Environment Environment                       `json:"environment"`
-	AppAppleId  int64                             `json:"appAppleId"`
-	BundleId    string                            `json:"bundleId"`
-	Data        []SubscriptionGroupIdentifierItem `json:"data"`
+// NewStoreClientWithHTTPClient creates a appstore server api client with a custom http client.
+func NewStoreClientWithHTTPClient(config *StoreConfig, httpClient HTTPClient) *StoreClient {
+	token := &Token{}
+	token.WithConfig(config)
+	hostUrl := HostProduction
+	if config.Sandbox {
+		hostUrl = HostSandBox
+	}
+
+	client := &StoreClient{
+		Token:   token,
+		cert:    newCert(config.TrustedCertPool),
+		httpCli: httpClient,
+		hostUrl: hostUrl,
+	}
+	return client
 }
 
-type SubscriptionGroupIdentifierItem struct {
-	SubscriptionGroupIdentifier string                 `json:"subscriptionGroupIdentifier"`
-	LastTransactions            []LastTransactionsItem `json:"lastTransactions"`
+func (c *StoreClient) initHttpClient(hc HTTPClient) (DoFunc, error) {
+	authToken, err := c.Token.GenerateIfExpired()
+	if err != nil {
+		return nil, fmt.Errorf("appstore generate token err %w", err)
+	}
+	return AddHeader(hc, "Authorization", "Bearer "+authToken), nil
 }
 
-type LastTransactionsItem struct {
-	OriginalTransactionId string `json:"originalTransactionId"`
-	Status                int32  `json:"status"`
-	SignedRenewalInfo     string `json:"signedRenewalInfo"`
-	SignedTransactionInfo string `json:"signedTransactionInfo"`
+// GetALLSubscriptionStatuses https://developer.apple.com/documentation/appstoreserverapi/get_all_subscription_statuses
+func (c *StoreClient) GetALLSubscriptionStatuses(ctx context.Context, originalTransactionId string) (*StatusResponse, error) {
+	URL := c.hostUrl + PathGetALLSubscriptionStatus
+	URL = strings.Replace(URL, "{originalTransactionId}", originalTransactionId, -1)
+
+	var client HTTPClient
+	client = c.httpCli
+	client = SetInitializer(client, c.initHttpClient)
+	apiErr := &Error{}
+	client = SetResponseErrorHandler(client, json.Unmarshal, &apiErr)
+	client = RequireResponseStatus(client, http.StatusOK)
+	client = SetRequest(ctx, client, http.MethodGet, URL)
+	rsp := &StatusResponse{}
+	client = SetResponseBodyHandler(client, json.Unmarshal, rsp)
+
+	_, err := client.Do(nil)
+	if apiErr.errorCode != 0 {
+		return nil, apiErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return rsp, nil
 }
 
-// MassExtendRenewalDateRequest https://developer.apple.com/documentation/appstoreserverapi/massextendrenewaldaterequest
-type MassExtendRenewalDateRequest struct {
-	RequestIdentifier      string   `json:"requestIdentifier"`
-	ExtendByDays           int32    `json:"extendByDays"`
-	ExtendReasonCode       int32    `json:"extendReasonCode"`
-	ProductId              string   `json:"productId"`
-	StorefrontCountryCodes []string `json:"storefrontCountryCodes"`
+// GetTransactionInfo https://developer.apple.com/documentation/appstoreserverapi/get_transaction_info
+func (c *StoreClient) GetTransactionInfo(ctx context.Context, transactionId string) (*TransactionInfoResponse, error) {
+	URL := c.hostUrl + PathTransactionInfo
+	URL = strings.Replace(URL, "{transactionId}", transactionId, -1)
+
+	var client HTTPClient
+	client = c.httpCli
+	client = SetInitializer(client, c.initHttpClient)
+	apiErr := &Error{}
+	client = SetResponseErrorHandler(client, json.Unmarshal, &apiErr)
+	client = RequireResponseStatus(client, http.StatusOK)
+	client = SetRequest(ctx, client, http.MethodGet, URL)
+	rsp := &TransactionInfoResponse{}
+	client = SetResponseBodyHandler(client, json.Unmarshal, rsp)
+
+	_, err := client.Do(nil)
+	if apiErr.errorCode != 0 {
+		return nil, apiErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return rsp, nil
 }
 
-// ConsumptionRequestBody https://developer.apple.com/documentation/appstoreserverapi/consumptionrequest
-type ConsumptionRequestBody struct {
-	AccountTenure            int32  `json:"accountTenure"`
-	AppAccountToken          string `json:"appAccountToken"`
-	ConsumptionStatus        int32  `json:"consumptionStatus"`
-	CustomerConsented        bool   `json:"customerConsented"`
-	DeliveryStatus           int32  `json:"deliveryStatus"`
-	LifetimeDollarsPurchased int32  `json:"lifetimeDollarsPurchased"`
-	LifetimeDollarsRefunded  int32  `json:"lifetimeDollarsRefunded"`
-	Platform                 int32  `json:"platform"`
-	PlayTime                 int32  `json:"playTime"`
-	SampleContentProvided    bool   `json:"sampleContentProvided"`
-	UserStatus               int32  `json:"userStatus"`
-	RefundPreference         int32  `json:"refundPreference"`
+// LookupOrderID https://developer.apple.com/documentation/appstoreserverapi/look_up_order_id
+func (c *StoreClient) LookupOrderID(ctx context.Context, orderId string) (*OrderLookupResponse, error) {
+	URL := c.hostUrl + PathLookUp
+	URL = strings.Replace(URL, "{orderId}", orderId, -1)
+
+	var client HTTPClient
+	client = c.httpCli
+	client = SetInitializer(client, c.initHttpClient)
+	apiErr := &Error{}
+	client = SetResponseErrorHandler(client, json.Unmarshal, &apiErr)
+	client = RequireResponseStatus(client, http.StatusOK)
+	client = SetRequest(ctx, client, http.MethodGet, URL)
+	rsp := &OrderLookupResponse{}
+	client = SetResponseBodyHandler(client, json.Unmarshal, rsp)
+
+	_, err := client.Do(nil)
+	if apiErr.errorCode != 0 {
+		return nil, apiErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return rsp, nil
 }
 
-// JWSRenewalInfoDecodedPayload https://developer.apple.com/documentation/appstoreserverapi/jwsrenewalinfodecodedpayload
-type JWSRenewalInfoDecodedPayload struct {
-	AppAccountToken             string            `json:"appAccountToken,omitempty"`
-	AppTransactionId            string            `json:"appTransactionId,omitempty"`
-	AutoRenewProductId          string            `json:"autoRenewProductId"`
-	AutoRenewStatus             int32             `json:"autoRenewStatus"`
-	Environment                 Environment       `json:"environment"`
-	ExpirationIntent            int32             `json:"expirationIntent"`
-	GracePeriodExpiresDate      int64             `json:"gracePeriodExpiresDate"`
-	IsInBillingRetryPeriod      *bool             `json:"isInBillingRetryPeriod"`
-	OfferIdentifier             string            `json:"offerIdentifier"`
-	OfferType                   int32             `json:"offerType"`
-	OfferPeriod                 string            `json:"offerPeriod"`
-	OriginalTransactionId       string            `json:"originalTransactionId"`
-	PriceIncreaseStatus         *int32            `json:"priceIncreaseStatus"`
-	ProductId                   string            `json:"productId"`
-	RecentSubscriptionStartDate int64             `json:"recentSubscriptionStartDate"`
-	RenewalDate                 int64             `json:"renewalDate"`
-	SignedDate                  int64             `json:"signedDate"`
-	RenewalPrice                int64             `json:"renewalPrice,omitempty"`
-	Currency                    string            `json:"currency,omitempty"`
-	OfferDiscountType           OfferDiscountType `json:"offerDiscountType,omitempty"`
-	EligibleWinBackOfferIds     []string          `json:"eligibleWinBackOfferIds,omitempty"`
+// GetTransactionHistory https://developer.apple.com/documentation/appstoreserverapi/get_transaction_history
+func (c *StoreClient) GetTransactionHistory(ctx context.Context, originalTransactionId string, query *url.Values) (responses []*HistoryResponse, err error) {
+	URL := c.hostUrl + PathTransactionHistory
+	URL = strings.Replace(URL, "{originalTransactionId}", originalTransactionId, -1)
+
+	if query == nil {
+		query = &url.Values{}
+	}
+
+	for {
+		var client HTTPClient
+		client = c.httpCli
+		client = SetInitializer(client, c.initHttpClient)
+		apiErr := &Error{}
+		client = SetResponseErrorHandler(client, json.Unmarshal, &apiErr)
+		client = RequireResponseStatus(client, http.StatusOK)
+
+		rsp := HistoryResponse{}
+		client = SetResponseBodyHandler(client, json.Unmarshal, &rsp)
+		client = SetRequest(ctx, client, http.MethodGet, URL+"?"+query.Encode())
+		_, errDo := client.Do(nil)
+		if apiErr.errorCode != 0 {
+			return nil, apiErr
+		}
+		if errDo != nil {
+			return nil, errDo
+		}
+
+		responses = append(responses, &rsp)
+		if rsp.HasMore && rsp.Revision != "" {
+			query.Set("revision", rsp.Revision)
+		} else {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
-func (J JWSRenewalInfoDecodedPayload) Valid() error {
-	return nil
+// GetRefundHistory https://developer.apple.com/documentation/appstoreserverapi/get_refund_history
+func (c *StoreClient) GetRefundHistory(ctx context.Context, originalTransactionId string) (responses []*RefundLookupResponse, err error) {
+	baseURL := c.hostUrl + PathRefundHistory
+	baseURL = strings.Replace(baseURL, "{originalTransactionId}", originalTransactionId, -1)
+	URL := baseURL
+
+	for {
+		var client HTTPClient
+		client = c.httpCli
+		client = SetInitializer(client, c.initHttpClient)
+		apiErr := &Error{}
+		client = SetResponseErrorHandler(client, json.Unmarshal, &apiErr)
+		client = RequireResponseStatus(client, http.StatusOK)
+		rsp := RefundLookupResponse{}
+		client = SetRequest(ctx, client, http.MethodGet, URL)
+		client = SetResponseBodyHandler(client, json.Unmarshal, &rsp)
+		_, err = client.Do(nil)
+		if apiErr.errorCode != 0 {
+			return nil, apiErr
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		responses = append(responses, &rsp)
+		if !rsp.HasMore {
+			return
+		}
+
+		data := url.Values{}
+		if rsp.Revision != "" {
+			data.Set("revision", rsp.Revision)
+			URL = baseURL + "?" + data.Encode()
+		} else {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
-func (J JWSRenewalInfoDecodedPayload) GetAudience() (jwt.ClaimStrings, error) {
+// SendConsumptionInfo https://developer.apple.com/documentation/appstoreserverapi/send_consumption_information
+func (c *StoreClient) SendConsumptionInfo(ctx context.Context, originalTransactionId string, body ConsumptionRequestBody) (statusCode int, err error) {
+	URL := c.hostUrl + PathConsumptionInfo
+	URL = strings.Replace(URL, "{originalTransactionId}", originalTransactionId, -1)
+
+	bodyBuf := new(bytes.Buffer)
+	err = json.NewEncoder(bodyBuf).Encode(body)
+	if err != nil {
+		return 0, err
+	}
+
+	statusCode, _, err = c.Do(ctx, http.MethodPut, URL, bodyBuf)
+	if err != nil {
+		return statusCode, err
+	}
+	return statusCode, nil
+}
+
+// ExtendSubscriptionRenewalDate https://developer.apple.com/documentation/appstoreserverapi/extend_a_subscription_renewal_date
+func (c *StoreClient) ExtendSubscriptionRenewalDate(ctx context.Context, originalTransactionId string, body ExtendRenewalDateRequest) (statusCode int, err error) {
+	URL := c.hostUrl + PathExtendSubscriptionRenewalDate
+	URL = strings.Replace(URL, "{originalTransactionId}", originalTransactionId, -1)
+
+	bodyBuf := new(bytes.Buffer)
+	err = json.NewEncoder(bodyBuf).Encode(body)
+	if err != nil {
+		return 0, err
+	}
+
+	statusCode, _, err = c.Do(ctx, http.MethodPut, URL, bodyBuf)
+	if err != nil {
+		return statusCode, err
+	}
+	return statusCode, nil
+}
+
+// ExtendSubscriptionRenewalDateForAll https://developer.apple.com/documentation/appstoreserverapi/extend_subscription_renewal_dates_for_all_active_subscribers
+func (c *StoreClient) ExtendSubscriptionRenewalDateForAll(ctx context.Context, body MassExtendRenewalDateRequest) (statusCode int, err error) {
+	URL := HostProduction + PathExtendSubscriptionRenewalDateForAll
+	if c.Token.Sandbox {
+		URL = HostSandBox + PathExtendSubscriptionRenewalDateForAll
+	}
+
+	bodyBuf := new(bytes.Buffer)
+	err = json.NewEncoder(bodyBuf).Encode(body)
+	if err != nil {
+		return 0, err
+	}
+
+	statusCode, _, err = c.Do(ctx, http.MethodPost, URL, bodyBuf)
+	if err != nil {
+		return statusCode, err
+	}
+	return statusCode, nil
+}
+
+// GetSubscriptionRenewalDataStatus https://developer.apple.com/documentation/appstoreserverapi/get_status_of_subscription_renewal_date_extensions
+func (c *StoreClient) GetSubscriptionRenewalDataStatus(ctx context.Context, productId, requestIdentifier string) (statusCode int, rsp *MassExtendRenewalDateStatusResponse, err error) {
+	URL := HostProduction + PathGetStatusOfSubscriptionRenewalDate
+	if c.Token.Sandbox {
+		URL = HostSandBox + PathGetStatusOfSubscriptionRenewalDate
+	}
+	URL = strings.Replace(URL, "{productId}", productId, -1)
+	URL = strings.Replace(URL, "{requestIdentifier}", requestIdentifier, -1)
+
+	statusCode, body, err := c.Do(ctx, http.MethodGet, URL, nil)
+	if err != nil {
+		return statusCode, nil, err
+	}
+
+	if statusCode != http.StatusOK {
+		return statusCode, nil, fmt.Errorf("appstore api: %v return status code %v", URL, statusCode)
+	}
+
+	err = json.Unmarshal(body, &rsp)
+	if err != nil {
+		return statusCode, nil, err
+	}
+
+	return statusCode, rsp, nil
+}
+
+// GetNotificationHistory https://developer.apple.com/documentation/appstoreserverapi/get_notification_history
+func (c *StoreClient) GetNotificationHistory(ctx context.Context, body NotificationHistoryRequest) (responses []NotificationHistoryResponseItem, err error) {
+	baseURL := c.hostUrl + PathGetNotificationHistory
+	URL := baseURL
+
+	for {
+		var client HTTPClient
+		client = c.httpCli
+		client = SetInitializer(client, c.initHttpClient)
+		apiErr := &Error{}
+		client = SetResponseErrorHandler(client, json.Unmarshal, &apiErr)
+		client = RequireResponseStatus(client, http.StatusOK)
+		rsp := NotificationHistoryResponses{}
+		rsp.NotificationHistory = make([]NotificationHistoryResponseItem, 0)
+
+		client = SetRequestBodyJSON(client, body)
+		client = SetRequest(ctx, client, http.MethodPost, URL)
+		client = SetResponseBodyHandler(client, json.Unmarshal, &rsp)
+		_, err = client.Do(nil)
+		if apiErr.errorCode != 0 {
+			return nil, apiErr
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		responses = append(responses, rsp.NotificationHistory...)
+		if !rsp.HasMore {
+			return responses, nil
+		}
+
+		data := url.Values{}
+		if rsp.PaginationToken != "" {
+			data.Set("paginationToken", rsp.PaginationToken)
+			URL = baseURL + "?" + data.Encode()
+		} else {
+			return responses, nil
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// SendRequestTestNotification https://developer.apple.com/documentation/appstoreserverapi/request_a_test_notification
+func (c *StoreClient) SendRequestTestNotification(ctx context.Context) (int, []byte, error) {
+	URL := c.hostUrl + PathRequestTestNotification
+
+	return c.Do(ctx, http.MethodPost, URL, nil)
+}
+
+// GetTestNotificationStatus https://developer.apple.com/documentation/appstoreserverapi/get_test_notification_status
+func (c *StoreClient) GetTestNotificationStatus(ctx context.Context, testNotificationToken string) (int, []byte, error) {
+	URL := c.hostUrl + PathGetTestNotificationStatus
+	URL = strings.Replace(URL, "{testNotificationToken}", testNotificationToken, -1)
+
+	return c.Do(ctx, http.MethodGet, URL, nil)
+}
+
+// SetAppAccountToken https://developer.apple.com/documentation/appstoreserverapi/set-app-account-tokenAdd
+func (c *StoreClient) SetAppAccountToken(ctx context.Context, originalTransactionId string, body UpdateAppAccountTokenRequest) (statusCode int, err error) {
+	URL := c.hostUrl + PathSetAppAccountToken
+	URL = strings.Replace(URL, "{originalTransactionId}", originalTransactionId, -1)
+
+	bodyBuf := new(bytes.Buffer)
+	err = json.NewEncoder(bodyBuf).Encode(body)
+	if err != nil {
+		return 0, err
+	}
+
+	statusCode, _, err = c.Do(ctx, http.MethodPut, URL, bodyBuf)
+	if err != nil {
+		return statusCode, err
+	}
+	return statusCode, nil
+}
+
+func (c *StoreClient) ParseNotificationV2(tokenStr string) (*jwt.Token, error) {
+	return jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		return c.cert.extractPublicKeyFromToken(tokenStr)
+	})
+}
+
+func (c *StoreClient) ParseNotificationV2WithClaim(tokenStr string) (jwt.Claims, error) {
+	result := &jwt.RegisteredClaims{}
+	_, err := jwt.ParseWithClaims(tokenStr, result, func(token *jwt.Token) (interface{}, error) {
+		return c.cert.extractPublicKeyFromToken(tokenStr)
+	})
+	return result, err
+}
+
+// ParseSignedPayload parses any signed JWS payload from a server notification into
+// a struct that implements the jwt.Claims interface.
+func (c *StoreClient) ParseSignedPayload(tokenStr string, claims jwt.Claims) error {
+	_, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (any, error) {
+		return c.cert.extractPublicKeyFromToken(tokenStr)
+	})
+
+	return err
+}
+
+// ParseNotificationV2 parses the signedPayload field from an App Store Server Notification response body
+// (https://developer.apple.com/documentation/appstoreservernotifications/responsebodyv2)
+func (c *StoreClient) ParseNotificationV2Payload(signedPayload string) (*NotificationPayload, error) {
+	var result NotificationPayload
+	if err := c.ParseSignedPayload(signedPayload, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// ParseNotificationV2 parses the signedTransactionInfo from decoded notification data
+// (https://developer.apple.com/documentation/appstoreservernotifications/data)
+func (c *StoreClient) ParseNotificationV2TransactionInfo(signedTransactionInfo string) (*JWSTransaction, error) {
+	var result JWSTransaction
+	if err := c.ParseSignedPayload(signedTransactionInfo, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// ParseNotificationV2 parses the signedRenewalInfo from decoded notification data
+// (https://developer.apple.com/documentation/appstoreservernotifications/data)
+func (c *StoreClient) ParseNotificationV2RenewalInfo(signedRenewalInfo string) (*JWSRenewalInfoDecodedPayload, error) {
+	var result JWSRenewalInfoDecodedPayload
+	if err := c.ParseSignedPayload(signedRenewalInfo, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// ParseSignedTransactions parse the jws singed transactions
+// Per doc: https://datatracker.ietf.org/doc/html/rfc7515#section-4.1.6
+func (c *StoreClient) ParseSignedTransactions(transactions []string) ([]*JWSTransaction, error) {
+	result := make([]*JWSTransaction, 0)
+	for _, v := range transactions {
+		trans, err := c.parseSignedTransaction(v)
+		if err == nil && trans != nil {
+			result = append(result, trans)
+		}
+	}
+
+	return result, nil
+}
+
+// ParseJWSEncodeString parse the jws encode string, such as JWSTransaction and JWSRenewalInfoDecodedPayload
+func (c *StoreClient) ParseJWSEncodeString(jwsEncode string) (interface{}, error) {
+	// Split the JWS format string into its three parts
+	parts := strings.Split(jwsEncode, ".")
+
+	// Decode the payload part of the JWS format string
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine which struct to use based on the payload contents
+	if strings.Contains(string(payload), "transactionId") {
+		transaction := &JWSTransaction{}
+		err = c.parseJWS(jwsEncode, transaction)
+		return transaction, err
+	} else if strings.Contains(string(payload), "renewalDate") {
+		renewalInfo := &JWSRenewalInfoDecodedPayload{}
+		err = c.parseJWS(jwsEncode, renewalInfo)
+		return renewalInfo, err
+	}
+
 	return nil, nil
 }
 
-func (J JWSRenewalInfoDecodedPayload) GetExpirationTime() (*jwt.NumericDate, error) {
-	return nil, nil
+func (c *StoreClient) parseJWS(jwsEncode string, claims jwt.Claims) error {
+	_, err := jwt.ParseWithClaims(jwsEncode, claims, func(token *jwt.Token) (interface{}, error) {
+		return c.cert.extractPublicKeyFromToken(jwsEncode)
+	})
+	return err
 }
 
-func (J JWSRenewalInfoDecodedPayload) GetIssuedAt() (*jwt.NumericDate, error) {
-	return nil, nil
+func (c *StoreClient) parseSignedTransaction(transaction string) (*JWSTransaction, error) {
+	tran := &JWSTransaction{}
+
+	err := c.parseJWS(transaction, tran)
+	if err != nil {
+		return nil, err
+	}
+
+	return tran, nil
 }
 
-func (J JWSRenewalInfoDecodedPayload) GetIssuer() (string, error) {
-	return "", nil
-}
+// Per doc: https://developer.apple.com/documentation/appstoreserverapi#topics
+func (c *StoreClient) Do(ctx context.Context, method string, url string, body io.Reader) (int, []byte, error) {
+	authToken, err := c.Token.GenerateIfExpired()
+	if err != nil {
+		return 0, nil, fmt.Errorf("appstore generate token err %w", err)
+	}
 
-func (J JWSRenewalInfoDecodedPayload) GetNotBefore() (*jwt.NumericDate, error) {
-	return nil, nil
-}
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("appstore new http request err %w", err)
+	}
 
-func (J JWSRenewalInfoDecodedPayload) GetSubject() (string, error) {
-	return "", nil
-}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("User-Agent", "App Store Client")
+	req = req.WithContext(ctx)
 
-// JWSDecodedHeader https://developer.apple.com/documentation/appstoreserverapi/jwsdecodedheader
-type JWSDecodedHeader struct {
-	Alg string   `json:"alg,omitempty"`
-	Kid string   `json:"kid,omitempty"`
-	X5C []string `json:"x5c,omitempty"`
-}
+	resp, err := c.httpCli.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("appstore http client do err %w", err)
+	}
+	defer resp.Body.Close()
 
-// TransactionReason indicates the cause of a purchase transaction,
-// https://developer.apple.com/documentation/appstoreservernotifications/transactionreason
-type TransactionReason string
+	byteData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("appstore read http body err %w", err)
+	}
 
-const (
-	TransactionReasonPurchase = "PURCHASE"
-	TransactionReasonRenewal  = "RENEWAL"
-)
+	if resp.StatusCode != http.StatusOK {
+		if rErr, ok := newAppStoreAPIError(byteData, resp.Header); ok {
+			return resp.StatusCode, byteData, rErr
+		}
+	}
 
-// IAPType https://developer.apple.com/documentation/appstoreserverapi/type
-type IAPType string
-
-const (
-	AutoRenewable IAPType = "Auto-Renewable Subscription"
-	NonConsumable IAPType = "Non-Consumable"
-	Consumable    IAPType = "Consumable"
-	NonRenewable  IAPType = "Non-Renewing Subscription"
-)
-
-type OfferDiscountType string
-
-const (
-	OfferDiscountTypeFreeTrial  OfferDiscountType = "FREE_TRIAL"
-	OfferDiscountTypePayAsYouGo OfferDiscountType = "PAY_AS_YOU_GO"
-	OfferDiscountTypePayUpFront OfferDiscountType = "PAY_UP_FRONT"
-)
-
-// JWSTransaction https://developer.apple.com/documentation/appstoreserverapi/jwstransaction
-type JWSTransaction struct {
-	AppTransactionId            string            `json:"appTransactionId,omitempty"`
-	TransactionID               string            `json:"transactionId,omitempty"`
-	OriginalTransactionId       string            `json:"originalTransactionId,omitempty"`
-	WebOrderLineItemId          string            `json:"webOrderLineItemId,omitempty"`
-	BundleID                    string            `json:"bundleId,omitempty"`
-	ProductID                   string            `json:"productId,omitempty"`
-	SubscriptionGroupIdentifier string            `json:"subscriptionGroupIdentifier,omitempty"`
-	PurchaseDate                int64             `json:"purchaseDate,omitempty"`
-	OriginalPurchaseDate        int64             `json:"originalPurchaseDate,omitempty"`
-	ExpiresDate                 int64             `json:"expiresDate,omitempty"`
-	Quantity                    int32             `json:"quantity,omitempty"`
-	Type                        IAPType           `json:"type,omitempty"`
-	AppAccountToken             string            `json:"appAccountToken,omitempty"`
-	InAppOwnershipType          string            `json:"inAppOwnershipType,omitempty"`
-	SignedDate                  int64             `json:"signedDate,omitempty"`
-	OfferType                   int32             `json:"offerType,omitempty"`
-	OfferPeriod                 string            `json:"offerPeriod,omitempty"`
-	OfferIdentifier             string            `json:"offerIdentifier,omitempty"`
-	RevocationDate              int64             `json:"revocationDate,omitempty"`
-	RevocationReason            *int32            `json:"revocationReason,omitempty"`
-	IsUpgraded                  bool              `json:"isUpgraded,omitempty"`
-	Storefront                  string            `json:"storefront,omitempty"`
-	StorefrontId                string            `json:"storefrontId,omitempty"`
-	TransactionReason           TransactionReason `json:"transactionReason,omitempty"`
-	Environment                 Environment       `json:"environment,omitempty"`
-	Price                       int64             `json:"price,omitempty"`
-	Currency                    string            `json:"currency,omitempty"`
-	OfferDiscountType           OfferDiscountType `json:"offerDiscountType,omitempty"`
-}
-
-func (J JWSTransaction) Valid() error {
-	return nil
-}
-func (J JWSTransaction) GetAudience() (jwt.ClaimStrings, error) {
-	return nil, nil
-}
-
-func (J JWSTransaction) GetExpirationTime() (*jwt.NumericDate, error) {
-	return nil, nil
-}
-
-func (J JWSTransaction) GetIssuedAt() (*jwt.NumericDate, error) {
-	return nil, nil
-}
-
-func (J JWSTransaction) GetIssuer() (string, error) {
-	return "", nil
-}
-
-func (J JWSTransaction) GetNotBefore() (*jwt.NumericDate, error) {
-	return nil, nil
-}
-
-func (J JWSTransaction) GetSubject() (string, error) {
-	return "", nil
-}
-
-// https://developer.apple.com/documentation/appstoreserverapi/extendreasoncode
-type ExtendReasonCode int
-
-const (
-	UndeclaredExtendReasonCode = iota
-	CustomerSatisfaction
-	OtherReasons
-	ServiceIssueOrOutage
-)
-
-// ExtendRenewalDateRequest https://developer.apple.com/documentation/appstoreserverapi/extendrenewaldaterequest
-type ExtendRenewalDateRequest struct {
-	ExtendByDays      int32            `json:"extendByDays"`
-	ExtendReasonCode  ExtendReasonCode `json:"extendReasonCode"`
-	RequestIdentifier string           `json:"requestIdentifier"`
-}
-
-// MassExtendRenewalDateStatusResponse https://developer.apple.com/documentation/appstoreserverapi/massextendrenewaldatestatusresponse
-type MassExtendRenewalDateStatusResponse struct {
-	RequestIdentifier string `json:"requestIdentifier"`
-	Complete          bool   `json:"complete"`
-	CompleteDate      int64  `json:"completeDate,omitempty"`
-	FailedCount       int64  `json:"failedCount,omitempty"`
-	SucceededCount    int64  `json:"succeededCount,omitempty"`
-}
-
-// NotificationHistoryRequest https://developer.apple.com/documentation/appstoreserverapi/notificationhistoryrequest
-type NotificationHistoryRequest struct {
-	StartDate             int64              `json:"startDate"`
-	EndDate               int64              `json:"endDate"`
-	OriginalTransactionId string             `json:"originalTransactionId,omitempty"`
-	NotificationType      NotificationTypeV2 `json:"notificationType,omitempty"`
-	NotificationSubtype   SubtypeV2          `json:"notificationSubtype,omitempty"`
-	OnlyFailures          bool               `json:"onlyFailures,omitempty"`
-	TransactionId         string             `json:"transactionId,omitempty"`
-}
-
-type NotificationTypeV2 string
-
-// list of notificationType
-// https://developer.apple.com/documentation/appstoreservernotifications/notificationtype
-const (
-	NotificationTypeV2ConsumptionRequest     NotificationTypeV2 = "CONSUMPTION_REQUEST"
-	NotificationTypeV2DidChangeRenewalPref   NotificationTypeV2 = "DID_CHANGE_RENEWAL_PREF"
-	NotificationTypeV2DidChangeRenewalStatus NotificationTypeV2 = "DID_CHANGE_RENEWAL_STATUS"
-	NotificationTypeV2DidFailToRenew         NotificationTypeV2 = "DID_FAIL_TO_RENEW"
-	NotificationTypeV2DidRenew               NotificationTypeV2 = "DID_RENEW"
-	NotificationTypeV2Expired                NotificationTypeV2 = "EXPIRED"
-	NotificationTypeV2GracePeriodExpired     NotificationTypeV2 = "GRACE_PERIOD_EXPIRED"
-	NotificationTypeV2OfferRedeemed          NotificationTypeV2 = "OFFER_REDEEMED"
-	NotificationTypeV2PriceIncrease          NotificationTypeV2 = "PRICE_INCREASE"
-	NotificationTypeV2Refund                 NotificationTypeV2 = "REFUND"
-	NotificationTypeV2RefundDeclined         NotificationTypeV2 = "REFUND_DECLINED"
-	NotificationTypeV2RenewalExtended        NotificationTypeV2 = "RENEWAL_EXTENDED"
-	NotificationTypeV2Revoke                 NotificationTypeV2 = "REVOKE"
-	NotificationTypeV2Subscribed             NotificationTypeV2 = "SUBSCRIBED"
-	NotificationTypeV2OneTimeCharge          NotificationTypeV2 = "ONE_TIME_CHARGE"
-	NotificationTypeV2RefundReversed         NotificationTypeV2 = "REFUND_REVERSED"
-	NotificationTypeV2ExternalPurchaseToken  NotificationTypeV2 = "EXTERNAL_PURCHASE_TOKEN"
-	NotificationTypeV2RenewalExtension       NotificationTypeV2 = "RENEWAL_EXTENSION"
-	NotificationTypeV2Test                   NotificationTypeV2 = "TEST"
-)
-
-// SubtypeV2 is type
-type SubtypeV2 string
-
-// list of subtypes
-// https://developer.apple.com/documentation/appstoreservernotifications/subtype
-const (
-	SubTypeV2InitialBuy        SubtypeV2 = "INITIAL_BUY"
-	SubTypeV2Resubscribe       SubtypeV2 = "RESUBSCRIBE"
-	SubTypeV2Downgrade         SubtypeV2 = "DOWNGRADE"
-	SubTypeV2Upgrade           SubtypeV2 = "UPGRADE"
-	SubTypeV2AutoRenewEnabled  SubtypeV2 = "AUTO_RENEW_ENABLED"
-	SubTypeV2AutoRenewDisabled SubtypeV2 = "AUTO_RENEW_DISABLED"
-	SubTypeV2Voluntary         SubtypeV2 = "VOLUNTARY"
-	SubTypeV2BillingRetry      SubtypeV2 = "BILLING_RETRY"
-	SubTypeV2PriceIncrease     SubtypeV2 = "PRICE_INCREASE"
-	SubTypeV2GracePeriod       SubtypeV2 = "GRACE_PERIOD"
-	SubTypeV2BillingRecovery   SubtypeV2 = "BILLING_RECOVERY"
-	SubTypeV2Pending           SubtypeV2 = "PENDING"
-	SubTypeV2Accepted          SubtypeV2 = "ACCEPTED"
-)
-
-// NotificationHistoryResponses https://developer.apple.com/documentation/appstoreserverapi/notificationhistoryresponse
-type NotificationHistoryResponses struct {
-	HasMore             bool                              `json:"hasMore"`
-	PaginationToken     string                            `json:"paginationToken"`
-	NotificationHistory []NotificationHistoryResponseItem `json:"notificationHistory"`
-}
-
-// NotificationHistoryResponseItem https://developer.apple.com/documentation/appstoreserverapi/notificationhistoryresponseitem
-type NotificationHistoryResponseItem struct {
-	SignedPayload          string                 `json:"signedPayload"`
-	FirstSendAttemptResult FirstSendAttemptResult `json:"firstSendAttemptResult"`
-	SendAttempts           []SendAttemptItem      `json:"sendAttempts"`
-}
-
-// SendAttemptItem https://developer.apple.com/documentation/appstoreserverapi/sendattemptitem
-type SendAttemptItem struct {
-	AttemptDate       int64                  `json:"attemptDate"`
-	SendAttemptResult FirstSendAttemptResult `json:"sendAttemptResult"`
-}
-
-// https://developer.apple.com/documentation/appstoreserverapi/firstsendattemptresult
-type FirstSendAttemptResult string
-
-const (
-	FirstSendAttemptResultSuccess            FirstSendAttemptResult = "SUCCESS"
-	FirstSendAttemptResultCircularRedirect   FirstSendAttemptResult = "CIRCULAR_REDIRECT"
-	FirstSendAttemptResultInvalidResponse    FirstSendAttemptResult = "INVALID_RESPONSE"
-	FirstSendAttemptResultNoResponse         FirstSendAttemptResult = "NO_RESPONSE"
-	FirstSendAttemptResultOther              FirstSendAttemptResult = "OTHER"
-	FirstSendAttemptResultPrematureClose     FirstSendAttemptResult = "PREMATURE_CLOSE"
-	FirstSendAttemptResultSocketIssue        FirstSendAttemptResult = "SOCKET_ISSUE"
-	FirstSendAttemptResultTimedOut           FirstSendAttemptResult = "TIMED_OUT"
-	FirstSendAttemptResultTlsIssue           FirstSendAttemptResult = "TLS_ISSUE"
-	FirstSendAttemptResultUnsupportedCharset FirstSendAttemptResult = "UNSUPPORTED_CHARSET"
-)
-
-// SendTestNotificationResponse https://developer.apple.com/documentation/appstoreserverapi/sendtestnotificationresponse
-type SendTestNotificationResponse struct {
-	TestNotificationToken string `json:"testNotificationToken"`
-}
-
-// Notification body https://developer.apple.com/documentation/appstoreservernotifications/responsebodyv2
-type NotificationV2 struct {
-	SignedPayload string `json:"signedPayload"`
-}
-
-// Notification signed payload
-type NotificationPayload struct {
-	jwt.RegisteredClaims
-	NotificationType    string           `json:"notificationType"`
-	Subtype             string           `json:"subtype"`
-	NotificationUUID    string           `json:"notificationUUID"`
-	NotificationVersion string           `json:"notificationVersion"`
-	Data                NotificationData `json:"data"`
-}
-
-// Notification Data
-type NotificationData struct {
-	jwt.RegisteredClaims
-	AppAppleID               int    `json:"appAppleId"`
-	BundleID                 string `json:"bundleId"`
-	BundleVersion            string `json:"bundleVersion"`
-	ConsumptionRequestReason string `json:"consumptionRequestReason"`
-	Environment              string `json:"environment"`
-	SignedRenewalInfo        string `json:"signedRenewalInfo"`
-	SignedTransactionInfo    string `json:"signedTransactionInfo"`
-	Status                   int    `json:"status"`
-}
-
-// Notification Transaction Info
-type TransactionInfo struct {
-	jwt.RegisteredClaims
-	TransactionId               string `json:"transactionId"`
-	OriginalTransactionID       string `json:"originalTransactionId"`
-	WebOrderLineItemID          string `json:"webOrderLineItemId"`
-	BundleID                    string `json:"bundleId"`
-	ProductID                   string `json:"productId"`
-	SubscriptionGroupIdentifier string `json:"subscriptionGroupIdentifier"`
-	PurchaseDate                int    `json:"purchaseDate"`
-	OriginalPurchaseDate        int    `json:"originalPurchaseDate"`
-	ExpiresDate                 int    `json:"expiresDate"`
-	Type                        string `json:"type"`
-	InAppOwnershipType          string `json:"inAppOwnershipType"`
-	SignedDate                  int    `json:"signedDate"`
-	Environment                 string `json:"environment"`
-}
-
-// Notification Renewal Info
-type RenewalInfo struct {
-	jwt.RegisteredClaims
-	OriginalTransactionID  string `json:"originalTransactionId"`
-	ExpirationIntent       int    `json:"expirationIntent"`
-	AutoRenewProductId     string `json:"autoRenewProductId"`
-	ProductID              string `json:"productId"`
-	AutoRenewStatus        int    `json:"autoRenewStatus"`
-	IsInBillingRetryPeriod *bool  `json:"isInBillingRetryPeriod"`
-	SignedDate             int    `json:"signedDate"`
-	Environment            string `json:"environment"`
-}
-
-type UpdateAppAccountTokenRequest struct {
-	AppAccountToken string `json:"appAccountToken"`
+	return resp.StatusCode, byteData, err
 }
