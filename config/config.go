@@ -1,46 +1,30 @@
 package config
 
 import (
-	"errors"
+	"fmt"
 	"os"
-	"simvizlab-backend/infra/logger"
-
-	"github.com/spf13/viper"
 )
 
-type Configuration struct {
-	Server ServerConfiguration
+type ServerConfiguration struct {
+	Port string
 }
 
-// SetupConfig configuration
+// SetupConfig validates required environment variables
 func SetupConfig() error {
-	var configuration Configuration
-
-	pwd, err := os.Getwd()
-	if err != nil {
-		logger.Errorf("error getting working directory: %s", err)
-		return err
+	requiredVars := []string{
+		"SERVER_PORT",
+		"MONGODB_URI",
+		"APPSTORE_KEY_ID",
+		"APPSTORE_ISSUER_ID",
+		"APPSTORE_PRIVATE_KEY",
+		"APPSTORE_BUNDLE_ID",
+		"BASE_URL",
 	}
 
-	// Enable reading from environment variables
-	viper.AutomaticEnv()
-
-	// Try to read from .env file if present, but don't fail if it's missing
-	viper.SetConfigFile(pwd + "/.env")
-	if err := viper.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if errors.As(err, &notFound) {
-			logger.Warnf(".env file not found; continuing with environment variables and defaults")
-		} else {
-			logger.Errorf("Error reading config file: %s", err)
-			return err
+	for _, key := range requiredVars {
+		if os.Getenv(key) == "" {
+			return fmt.Errorf("missing required environment variable: %s", key)
 		}
-	}
-
-	err := viper.Unmarshal(&configuration)
-	if err != nil {
-		logger.Errorf("error to decode, %v", err)
-		return err
 	}
 
 	return nil

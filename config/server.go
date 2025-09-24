@@ -2,21 +2,22 @@ package config
 
 import (
 	"fmt"
-	"github.com/spf13/viper"
 	"log"
+	"os"
 )
 
-type ServerConfiguration struct {
-	Port                 string
-	Secret               string
-	LimitCountPerRequest int64
-}
-
 func ServerConfig() string {
-	viper.SetDefault("SERVER_HOST", "0.0.0.0")
-	viper.SetDefault("SERVER_PORT", "8000")
+	host := os.Getenv("SERVER_HOST")
+	if host == "" {
+		host = "0.0.0.0"
+	}
 
-	appServer := fmt.Sprintf("%s:%s", viper.GetString("SERVER_HOST"), viper.GetString("SERVER_PORT"))
-	log.Print("Server Running at :", appServer)
+	port := os.Getenv("SERVER_PORT")
+	if port == "" {
+		port = "8000"
+	}
+
+	appServer := fmt.Sprintf("%s:%s", host, port)
+	log.Printf("Server running at: %s", appServer)
 	return appServer
 }
