@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"time"
 
 	"simvizlab-backend/config"
@@ -18,6 +19,13 @@ func main() {
 	if err := gotenv.Load(); err != nil {
 		log.Println("No .env file found, relying on system environment variables")
 	}
+
+	pwd, err := os.Getwd()
+	if err != nil {
+		log.Println("Failed to get working directory:", err)
+	}
+
+	log.Printf("PWD:%s", pwd)
 
 	// Set default timezone
 	viper.SetDefault("SERVER_TIMEZONE", "Asia/Dhaka")

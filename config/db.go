@@ -1,11 +1,11 @@
 package config
 
 import (
-	"github.com/spf13/viper"
+	"os"
 )
 
 func MongoDBUri() string {
-	uri := viper.GetString("MONGODB_URI")
+	uri := os.Getenv("MONGODB_URI")
 	if uri == "" {
 		// Fallback to localhost if no URI is provided
 		return "mongodb://localhost:27017/simvizlab"
